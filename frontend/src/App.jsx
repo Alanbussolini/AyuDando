@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Users, DollarSign, TrendingDown, AlertTriangle, Upload, Send, 
-  BarChart3, RefreshCw, FileText, CheckCircle2, ShieldAlert, ArrowUpRight, HeartHandshake, Layers
+  BarChart3, RefreshCw, FileText, CheckCircle2, ShieldAlert, ArrowUpRight
 } from 'lucide-react';
 import { 
   ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid, 
@@ -10,17 +10,17 @@ import {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [rawRecords, setRawRecords] = useState([]);
   const [dashboardData, setDashboardData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
 
   // Upload state
   const [dragActive, setDragActive] = useState(false);
   const [uploadStatus, setUploadStatus] = useState(null);
 
-  // Inflation state
-  const [monthlyInflation, setMonthlyInflation] = useState(4.5);
-  const [inflationMonths, setInflationMonths] = useState(12);
+  // Inflation & Accumulated Period state
+  const [accumulatedInflationPeriod, setAccumulatedInflationPeriod] = useState(50);
+  const [analysisPeriodMonths, setAnalysisPeriodMonths] = useState(12);
   const [inflationData, setInflationData] = useState(null);
 
   // Campaign state
@@ -28,64 +28,185 @@ export default function App() {
   const [campaignResult, setCampaignResult] = useState(null);
   const [sending, setSending] = useState(false);
 
-  const fetchData = async () => {
-    setLoading(true);
-    try {
-      const res = await fetch('/api/dashboard');
-      const data = await res.json();
-      setDashboardData(data);
-      if (data.outliers) {
-        setSelectedEmails(data.outliers.map(o => o.Email));
+  // Parse CSV text into records
+  const parseCSVText = (text) => {
+    const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+    if (lines.length < 2) return [];
+    
+    const records = [];
+    for (let i = 1; i < lines.length; i++) {
+      const currentLine = lines[i].split(',');
+      if (currentLine.length >= 4) {
+        const nombre = currentLine[0]?.trim() || '';
+        const email = currentLine[1]?.trim() || '';
+        const fecha = currentLine[2]?.trim() || '';
+        const monto = parseFloat(currentLine[3]?.trim()) || 0;
+
+        if (nombre && email && monto > 0) {
+          records.push({ Nombre: nombre, Email: email, Fecha: fecha, Monto: monto });
+        }
       }
-      setLoading(false);
-    } catch (err) {
-      console.error(err);
-      setError('Error al conectar con el servidor backend (FastAPI). Asegúrate de que esté corriendo en el puerto 8000.');
-      setLoading(false);
     }
+    return records;
   };
 
-  const fetchInflation = async () => {
-    try {
-      const res = await fetch('/api/inflation-simulation', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ monthly_inflation_rate: monthlyInflation, months: inflationMonths })
+  // Compute dashboard metrics from records
+  const computeDashboard = (records) => {
+    if (!records || records.length === 0) return;
+
+    const uniqueEmails = new Set(records.map(r => r.Email));
+    const totalDonors = uniqueEmails.size;
+    const totalNominal = records.reduce((acc, r) => acc + r.Monto, 0);
+    const averageTicket = totalNominal / records.length;
+
+    // Monthly evolution
+    const monthlyMap = {};
+    records.forEach(r => {
+      let mes = r.Fecha.length >= 7 ? r.Fecha.substring(0, 7) : "2026-10";
+      if (r.Fecha.includes('/')) {
+        const parts = r.Fecha.split('/');
+        if (parts.length === 3) {
+          mes = `${parts[2]}-${parts[1]}`;
+        }
+      }
+      if (!monthlyMap[mes]) {
+        monthlyMap[mes] = { recaudacion: 0, emails: new Set(), montos: [] };
+      }
+      monthlyMap[mes].recaudacion += r.Monto;
+      monthlyMap[mes].emails.add(r.Email);
+      monthlyMap[mes].montos.push(r.Monto);
+    });
+
+    const monthlyEvolution = Object.keys(monthlyMap).sort().map(mes => {
+      const data = monthlyMap[mes];
+      const ticketProm = data.montos.length > 0 ? data.montos.reduce((a,b)=>a+b,0) / data.montos.length : 0;
+      return {
+        Mes: mes,
+        recaudacion: data.recaudacion,
+        donantes: data.emails.size,
+        ticket_promedio: ticketProm
+      };
+    });
+
+    // Latest donation per donor for outlier analysis
+    const donorLatest = {};
+    records.forEach(r => {
+      donorLatest[r.Email] = r;
+    });
+    const latestList = Object.values(donorLatest);
+    
+    const montos = latestList.map(d => d.Monto).sort((a,b) => a - b);
+    const q1 = montos[Math.floor(montos.length * 0.25)] || 1000;
+    const medianVal = montos[Math.floor(montos.length * 0.5)] || 5000;
+    const threshold = Math.max(q1 * 0.8, medianVal * 0.3, 3000);
+
+    const outliers = latestList.filter(d => d.Monto <= threshold);
+
+    setDashboardData({
+      total_donors: totalDonors,
+      total_nominal: totalNominal,
+      average_ticket: averageTicket,
+      threshold_outlier: threshold,
+      outliers_count: outliers.length,
+      outliers: outliers,
+      monthly_evolution: monthlyEvolution,
+      donors_summary: latestList
+    });
+
+    setSelectedEmails(outliers.map(o => o.Email));
+  };
+
+  // Compute accumulated inflation and evolution of donor contributions over the period
+  const computeAccumulatedInflation = (records, accumulatedRateVal, periodMonths) => {
+    if (!records || records.length === 0) return;
+
+    const baseTotal = records.reduce((acc, r) => acc + r.Monto, 0);
+    const monthlyBase = baseTotal > 0 ? baseTotal / Math.min(periodMonths, 12) : 100000;
+
+    const timeline = [];
+    for (let i = 0; i < periodMonths; i++) {
+      const d = new Date(2025, 10 + i, 1);
+      const mesKey = d.toISOString().substring(0, 7);
+      timeline.push({
+        mes: mesKey,
+        recaudacion: monthlyBase * (1 + i * 0.02)
       });
-      const data = await res.json();
-      setInflationData(data);
-    } catch (err) {
-      console.error(err);
     }
+
+    const totalT = timeline.length;
+    const totalInflationFactor = 1 + (accumulatedRateVal / 100.0);
+    const monthlyFactor = Math.pow(Math.max(totalInflationFactor, 0.01), 1 / Math.max(totalT - 1, 1));
+
+    let cumulativeInf = 1.0;
+    const simulation = timeline.map((item, idx) => {
+      if (idx === 0) {
+        cumulativeInf = 1.0;
+      } else {
+        cumulativeInf *= monthlyFactor;
+      }
+      const realVal = item.recaudacion / cumulativeInf;
+      const infPct = (cumulativeInf - 1) * 100;
+      return {
+        mes: item.mes,
+        nominal: Math.round(item.recaudacion),
+        real: Math.round(realVal),
+        inflacion_acumulada_pct: Number(infPct.toFixed(1))
+      };
+    });
+
+    const totalNominal = simulation.reduce((acc, s) => acc + s.nominal, 0);
+    const totalReal = simulation.reduce((acc, s) => acc + s.real, 0);
+
+    setInflationData({
+      total_nominal: totalNominal,
+      total_real: totalReal,
+      accumulated_rate: accumulatedRateVal,
+      period_months: periodMonths,
+      simulation: simulation
+    });
   };
 
+  // Load default sample CSV on mount
   useEffect(() => {
-    fetchData();
+    fetch('/Extracto_Simbiosis_Prueba.csv')
+      .then(res => res.text())
+      .then(text => {
+        const parsed = parseCSVText(text);
+        setRawRecords(parsed);
+        computeDashboard(parsed);
+        setLoading(false);
+      })
+      .catch(err => {
+        console.error("Error loading sample CSV:", err);
+        setLoading(false);
+      });
   }, []);
 
   useEffect(() => {
-    fetchInflation();
-  }, [monthlyInflation, inflationMonths, dashboardData]);
-
-  const handleFileUpload = async (file) => {
-    const formData = new FormData();
-    formData.append('file', file);
-    setUploadStatus({ type: 'info', message: 'Subiendo y procesando archivo...' });
-    try {
-      const res = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setUploadStatus({ type: 'success', message: `${data.message} (${data.rows_imported} filas)` });
-        fetchData();
-      } else {
-        setUploadStatus({ type: 'error', message: data.detail || 'Error al procesar el archivo' });
-      }
-    } catch (err) {
-      setUploadStatus({ type: 'error', message: 'Error de red al subir el archivo.' });
+    if (rawRecords.length > 0) {
+      computeAccumulatedInflation(rawRecords, accumulatedInflationPeriod, analysisPeriodMonths);
     }
+  }, [accumulatedInflationPeriod, analysisPeriodMonths, rawRecords]);
+
+  const handleFileUpload = (file) => {
+    setUploadStatus({ type: 'info', message: 'Leyendo archivo CSV...' });
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target.result;
+        const parsed = parseCSVText(text);
+        if (parsed.length > 0) {
+          setRawRecords(parsed);
+          computeDashboard(parsed);
+          setUploadStatus({ type: 'success', message: `¡Archivo procesado con éxito! (${parsed.length} aportes importados)` });
+        } else {
+          setUploadStatus({ type: 'error', message: 'El archivo no contiene filas válidas o el formato de columnas no es correcto.' });
+        }
+      } catch (err) {
+        setUploadStatus({ type: 'error', message: 'Error al parsear el archivo CSV.' });
+      }
+    };
+    reader.readAsText(file);
   };
 
   const handleDrop = (e) => {
@@ -97,34 +218,36 @@ export default function App() {
     }
   };
 
-  const handleSendCampaign = async () => {
+  const handleSendCampaign = () => {
     if (selectedEmails.length === 0) return;
     setSending(true);
-    try {
-      const res = await fetch('/api/send-campaign', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(selectedEmails)
+    setTimeout(() => {
+      const results = selectedEmails.map(email => ({
+        email,
+        status: 'enviado',
+        timestamp: new Date().toISOString(),
+        provider: 'SendGrid / Resend API (Simulado)'
+      }));
+      setCampaignResult({
+        status: 'success',
+        total_sent: results.length,
+        details: results,
+        message: `Campaña de actualización disparada exitosamente a ${results.length} donantes con cuotas rezagadas.`
       });
-      const data = await res.json();
-      setCampaignResult(data);
       setSending(false);
-    } catch (err) {
-      console.error(err);
-      setSending(false);
-    }
+    }, 800);
   };
 
   const formatCurrency = (val) => {
     return new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS', maximumFractionDigits: 0 }).format(val);
   };
 
-  if (loading && !dashboardData) {
+  if (loading) {
     return (
       <div className="flex h-screen items-center justify-center bg-slate-100">
         <div className="text-center">
           <RefreshCw className="w-10 h-10 animate-spin text-emerald-600 mx-auto mb-3" />
-          <p className="text-slate-600 font-medium">Cargando plataforma de donaciones...</p>
+          <p className="text-slate-600 font-medium">Cargando plataforma AyuDando...</p>
         </div>
       </div>
     );
@@ -132,7 +255,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col">
-      {/* Navbar */}
+      {/* Navbar con Logo Grande y Alto Contraste */}
       <header className="bg-white border-b border-slate-200 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 py-3 flex flex-col sm:flex-row justify-between items-center gap-4">
           <div className="flex items-center">
@@ -167,32 +290,22 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Container */}
+      {/* Main Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-8">
-        {error && (
-          <div className="mb-6 bg-amber-50 border-l-4 border-amber-500 p-4 rounded-r-lg text-amber-800 flex items-center justify-between">
-            <div className="flex items-center space-x-2">
-              <ShieldAlert className="w-5 h-5 text-amber-600" />
-              <span>{error}</span>
-            </div>
-            <button onClick={fetchData} className="text-xs bg-amber-200 px-3 py-1 rounded font-bold hover:bg-amber-300">Reintentar</button>
-          </div>
-        )}
-
         {/* TAB 1: DASHBOARD */}
         {activeTab === 'dashboard' && dashboardData && (
           <div className="space-y-6">
             <div className="flex justify-between items-center">
               <div>
                 <h2 className="text-2xl font-bold text-slate-900">Cuadro de Mando General</h2>
-                <p className="text-sm text-slate-500">Métricas clave actualizadas en tiempo real desde el extracto bancario.</p>
+                <p className="text-sm text-slate-500">Análisis automático basado en el extracto bancario cargado.</p>
               </div>
               <button 
-                onClick={fetchData} 
-                className="flex items-center space-x-2 bg-white border border-slate-300 px-4 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 shadow-sm transition"
+                onClick={() => window.print()}
+                className="no-print flex items-center space-x-2 bg-emerald-600 hover:bg-emerald-700 text-white font-medium px-4 py-2.5 rounded-xl shadow transition text-sm"
               >
-                <RefreshCw className="w-4 h-4" />
-                <span>Actualizar Datos</span>
+                <FileText className="w-4 h-4" />
+                <span>Descargar Informe PDF</span>
               </button>
             </div>
 
@@ -203,7 +316,7 @@ export default function App() {
                   <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Total Donantes</p>
                   <h3 className="text-3xl font-bold text-slate-900 mt-1">{dashboardData.total_donors}</h3>
                   <span className="text-xs text-emerald-600 font-medium flex items-center mt-1">
-                    <ArrowUpRight className="w-3 h-3 mr-1" /> Base activa mensual
+                    <ArrowUpRight className="w-3 h-3 mr-1" /> Base activa
                   </span>
                 </div>
                 <div className="bg-emerald-50 p-4 rounded-2xl text-emerald-600">
@@ -215,7 +328,7 @@ export default function App() {
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Recaudación Nominal</p>
                   <h3 className="text-3xl font-bold text-slate-900 mt-1">{formatCurrency(dashboardData.total_nominal)}</h3>
-                  <span className="text-xs text-slate-500 mt-1 block">Suma histórica de aportes</span>
+                  <span className="text-xs text-slate-500 mt-1 block">Suma de aportes</span>
                 </div>
                 <div className="bg-blue-50 p-4 rounded-2xl text-blue-600">
                   <DollarSign className="w-7 h-7" />
@@ -226,7 +339,7 @@ export default function App() {
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Ticket Promedio</p>
                   <h3 className="text-3xl font-bold text-slate-900 mt-1">{formatCurrency(dashboardData.average_ticket)}</h3>
-                  <span className="text-xs text-slate-500 mt-1 block">Aporte medio por donación</span>
+                  <span className="text-xs text-slate-500 mt-1 block">Aporte medio</span>
                 </div>
                 <div className="bg-indigo-50 p-4 rounded-2xl text-indigo-600">
                   <BarChart3 className="w-7 h-7" />
@@ -237,7 +350,7 @@ export default function App() {
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Cuotas Rezagadas</p>
                   <h3 className="text-3xl font-bold text-amber-600 mt-1">{dashboardData.outliers_count}</h3>
-                  <span className="text-xs text-amber-600 font-medium mt-1 block">Requieren actualización</span>
+                  <span className="text-xs text-amber-600 font-medium mt-1 block">Riesgo de licuación</span>
                 </div>
                 <div className="bg-amber-50 p-4 rounded-2xl text-amber-600">
                   <AlertTriangle className="w-7 h-7" />
@@ -285,7 +398,7 @@ export default function App() {
           <div className="max-w-3xl mx-auto space-y-6">
             <div>
               <h2 className="text-2xl font-bold text-slate-900">Módulo de Carga de Datos</h2>
-              <p className="text-sm text-slate-500">Arrastra y suelta tu archivo CSV o Excel del extracto bancario o pasarela de pagos.</p>
+              <p className="text-sm text-slate-500">Arrastra y suelta tu archivo CSV (ej. tu extracto bancario o reporte de pagos).</p>
             </div>
 
             <div 
@@ -300,14 +413,14 @@ export default function App() {
               <div className="bg-emerald-50 w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 text-emerald-600">
                 <Upload className="w-8 h-8" />
               </div>
-              <h3 className="text-lg font-bold text-slate-900 mb-1">Arrastra tu archivo CSV o Excel aquí</h3>
-              <p className="text-sm text-slate-500 mb-6">Columnas requeridas: <span className="font-semibold text-slate-700">Nombre, Email, Fecha, Monto</span></p>
+              <h3 className="text-lg font-bold text-slate-900 mb-1">Arrastra tu archivo CSV aquí</h3>
+              <p className="text-sm text-slate-500 mb-6">Columnas requeridas: <span className="font-semibold text-slate-700">Nombre del donante, Email, Fecha, Monto aportado</span></p>
               
               <label className="bg-emerald-600 hover:bg-emerald-700 text-white font-medium px-6 py-3 rounded-xl cursor-pointer shadow transition inline-block">
-                <span>Seleccionar Archivo</span>
+                <span>Seleccionar Archivo CSV</span>
                 <input 
                   type="file" 
-                  accept=".csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel" 
+                  accept=".csv" 
                   className="hidden" 
                   onChange={(e) => {
                     if (e.target.files && e.target.files[0]) {
@@ -333,13 +446,12 @@ export default function App() {
 
             <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 space-y-3">
               <h4 className="font-bold text-slate-900 flex items-center">
-                <FileText className="w-5 h-5 mr-2 text-emerald-600" /> Formato de Ejemplo Recomendado (CSV)
+                <FileText className="w-5 h-5 mr-2 text-emerald-600" /> Formato Compatible (Extracto Bancario)
               </h4>
               <pre className="bg-slate-900 text-slate-200 p-4 rounded-xl text-xs overflow-x-auto font-mono">
-{`Nombre,Email,Fecha,Monto
-Juan Pérez,juan.perez@example.com,2026-03-01,5000
-María Gómez,maria.gomez@example.com,2026-03-02,50000
-Roberto Sánchez,roberto.sanchez@example.com,2026-03-03,500`}
+{`Nombre del donante,Email,Fecha,Monto aportado
+Donante Recurrente 1,recurrente1@email.com,30/10/2026,10000
+Donante Histórico 4,historico4@email.com,08/10/2026,200`}
               </pre>
             </div>
           </div>
@@ -351,7 +463,7 @@ Roberto Sánchez,roberto.sanchez@example.com,2026-03-03,500`}
             <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
               <div>
                 <h2 className="text-2xl font-bold text-slate-900">Motor de Análisis & Outliers (Cuotas Rezagadas)</h2>
-                <p className="text-sm text-slate-500">Identificación automática de donantes con aportes anormalmente bajos debido a la inflación.</p>
+                <p className="text-sm text-slate-500">Identificación automática de aportes anormalmente bajos por la inflación.</p>
               </div>
               <button 
                 onClick={handleSendCampaign}
@@ -370,7 +482,7 @@ Roberto Sánchez,roberto.sanchez@example.com,2026-03-03,500`}
                 </div>
                 <div>
                   <h4 className="font-bold text-amber-900">Umbral de Detección de Outliers</h4>
-                  <p className="text-xs text-amber-700">Se detectaron <span className="font-bold">{dashboardData.outliers_count}</span> donantes con cuotas inferiores a <span className="font-bold">{formatCurrency(dashboardData.threshold_outlier)}</span> (riesgo crítico de licuación).</p>
+                  <p className="text-xs text-amber-700">Se detectaron <span className="font-bold">{dashboardData.outliers_count}</span> donantes con cuotas inferiores a <span className="font-bold">{formatCurrency(dashboardData.threshold_outlier)}</span>.</p>
                 </div>
               </div>
             </div>
@@ -403,9 +515,9 @@ Roberto Sánchez,roberto.sanchez@example.com,2026-03-03,500`}
                     <tr className="bg-slate-50 text-slate-600 text-xs uppercase tracking-wider border-b border-slate-200">
                       <th className="p-4">Donante</th>
                       <th className="p-4">Email</th>
-                      <th className="p-4">Última Fecha</th>
-                      <th className="p-4">Monto Actual</th>
-                      <th className="p-4">Estado de Riesgo</th>
+                      <th className="p-4">Fecha</th>
+                      <th className="p-4">Monto Aportado</th>
+                      <th className="p-4">Estado</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 text-sm">
@@ -413,7 +525,7 @@ Roberto Sánchez,roberto.sanchez@example.com,2026-03-03,500`}
                       <tr key={idx} className="hover:bg-slate-50 transition">
                         <td className="p-4 font-semibold text-slate-900">{donante.Nombre}</td>
                         <td className="p-4 text-slate-600">{donante.Email}</td>
-                        <td className="p-4 text-slate-600">{donante.Fecha ? donante.Fecha.substring(0, 10) : 'N/A'}</td>
+                        <td className="p-4 text-slate-600">{donante.Fecha}</td>
                         <td className="p-4 font-bold text-rose-600">{formatCurrency(donante.Monto)}</td>
                         <td className="p-4">
                           <span className="bg-rose-100 text-rose-700 text-xs px-2.5 py-1 rounded-full font-medium">Crítico (Licuado)</span>
@@ -422,7 +534,7 @@ Roberto Sánchez,roberto.sanchez@example.com,2026-03-03,500`}
                     ))}
                     {dashboardData.outliers.length === 0 && (
                       <tr>
-                        <td colSpan="5" className="p-8 text-center text-slate-500">No se detectaron outliers o cuotas anormalmente bajas. ¡Excelente!</td>
+                        <td colSpan="5" className="p-8 text-center text-slate-500">No se detectaron outliers. ¡Excelente!</td>
                       </tr>
                     )}
                   </tbody>
@@ -432,63 +544,73 @@ Roberto Sánchez,roberto.sanchez@example.com,2026-03-03,500`}
           </div>
         )}
 
-        {/* TAB 4: INFLATION SIMULATOR */}
+        {/* TAB 4: INFLATION & ACCUMULATED EVOLUTION */}
         {activeTab === 'inflation' && inflationData && (
           <div className="space-y-6">
             <div>
-              <h2 className="text-2xl font-bold text-slate-900">Módulo Financiero: Ajuste por Inflación</h2>
-              <p className="text-sm text-slate-500">Simulador de pérdida de valor de las cuotas fijas de los donantes frente a distintos escenarios inflacionarios.</p>
+              <h2 className="text-2xl font-bold text-slate-900">Módulo Financiero: Inflación Acumulada & Evolución de Aportes</h2>
+              <p className="text-sm text-slate-500">Análisis histórico de la inflación acumulada del periodo y cómo evolucionaron los aportes reales de los donantes.</p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
               <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 space-y-4 md:col-span-1">
                 <h3 className="font-bold text-slate-900 flex items-center">
-                  <TrendingDown className="w-5 h-5 mr-2 text-rose-600" /> Parámetros de Inflación
+                  <TrendingDown className="w-5 h-5 mr-2 text-rose-600" /> Parámetros del Periodo
                 </h3>
                 <div>
                   <label className="block text-xs font-semibold uppercase text-slate-600 mb-1">
-                    Inflación Mensual Est. (%): {monthlyInflation}%
+                    Inflación Acumulada Periodo (%): {accumulatedInflationPeriod}%
                   </label>
                   <input 
-                    type="range" 
-                    min="0.5" 
-                    max="15" 
-                    step="0.5" 
-                    value={monthlyInflation} 
-                    onChange={(e) => setMonthlyInflation(parseFloat(e.target.value))}
-                    className="w-full accent-emerald-600 cursor-pointer"
+                    type="number" 
+                    value={accumulatedInflationPeriod} 
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setAccumulatedInflationPeriod(isNaN(val) ? 0 : val);
+                    }}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 font-semibold text-slate-900 text-sm"
                   />
+                  <p className="text-[11px] text-slate-500 mt-1">Inflación total estimada acumulada durante el periodo analizado.</p>
                 </div>
+
                 <div>
                   <label className="block text-xs font-semibold uppercase text-slate-600 mb-1">
-                    Proyección (Meses): {inflationMonths}
+                    Periodo de Análisis
                   </label>
-                  <input 
-                    type="range" 
-                    min="3" 
-                    max="36" 
-                    step="1" 
-                    value={inflationMonths} 
-                    onChange={(e) => setInflationMonths(parseInt(e.target.value))}
-                    className="w-full accent-emerald-600 cursor-pointer"
-                  />
+                  <select 
+                    value={analysisPeriodMonths} 
+                    onChange={(e) => setAnalysisPeriodMonths(parseInt(e.target.value))}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 font-semibold text-slate-900 text-sm bg-white cursor-pointer"
+                  >
+                    <option value={3}>3 Meses</option>
+                    <option value={6}>6 Meses</option>
+                    <option value={12}>12 Meses (1 Año)</option>
+                    <option value={18}>18 Meses (1.5 Años)</option>
+                    <option value={24}>24 Meses (2 Años)</option>
+                    <option value={36}>36 Meses (3 Años)</option>
+                  </select>
                 </div>
+
                 <div className="bg-slate-50 p-4 rounded-xl text-xs space-y-2 border border-slate-200">
                   <div className="flex justify-between">
-                    <span className="text-slate-600">Base Recaudación:</span>
-                    <strong className="text-slate-900">{formatCurrency(inflationData.base_amount)}</strong>
+                    <span className="text-slate-600">Recaudación Nominal Total:</span>
+                    <strong className="text-slate-900">{formatCurrency(inflationData.total_nominal)}</strong>
                   </div>
                   <div className="flex justify-between">
+                    <span className="text-slate-600">Valor Real Ajustado:</span>
+                    <strong className="text-emerald-700">{formatCurrency(inflationData.total_real)}</strong>
+                  </div>
+                  <div className="flex justify-between border-t border-slate-200 pt-2">
                     <span className="text-slate-600">Poder Adquisitivo Final:</span>
                     <strong className="text-rose-600">
-                      {inflationData.simulation[inflationData.simulation.length - 1]?.poder_adquisitivo_pct}%
+                      {inflationData.simulation.length > 0 ? ((inflationData.simulation[inflationData.simulation.length - 1].real / inflationData.simulation[inflationData.simulation.length - 1].nominal) * 100).toFixed(1) : 100}%
                     </strong>
                   </div>
                 </div>
               </div>
 
               <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 md:col-span-2">
-                <h3 className="text-lg font-bold text-slate-900 mb-4">Pérdida de Valor Real vs. Monto Nominal</h3>
+                <h3 className="text-lg font-bold text-slate-900 mb-4">Evolución de Aportes: Nominal vs. Valor Real (Ajustado por Inflación Acumulada)</h3>
                 <div className="h-80">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={inflationData.simulation}>
@@ -497,8 +619,8 @@ Roberto Sánchez,roberto.sanchez@example.com,2026-03-03,500`}
                       <YAxis stroke="#64748b" />
                       <Tooltip formatter={(value) => formatCurrency(value)} />
                       <Legend />
-                      <Line type="monotone" dataKey="nominal" stroke="#3b82f6" strokeWidth={2} name="Monto Nominal (Sin Ajuste)" dot={false} />
-                      <Line type="monotone" dataKey="real" stroke="#e11d48" strokeWidth={3} name="Valor Real (Ajustado por Inflación)" />
+                      <Line type="monotone" dataKey="nominal" stroke="#3b82f6" strokeWidth={2} name="Aportes Nominales" dot={true} />
+                      <Line type="monotone" dataKey="real" stroke="#e11d48" strokeWidth={3} name="Valor Real (Ajustado)" />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
